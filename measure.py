@@ -1,5 +1,7 @@
 import gc
+import logging
 import os
+import time
 import torch
 from argparse import ArgumentParser
 from datasets import load_dataset
@@ -15,6 +17,51 @@ from utils.data import load_data
 from utils.models import has_tied_weights
 from utils.clip import magnitude_clip
 from utils.device import clear_device_cache, get_preferred_device, resolve_device_map, synchronize_device
+
+log = logging.getLogger("measure")
+
+
+class TqdmLoggingHandler(logging.Handler):
+    """Write log records through tqdm.write so they don't corrupt progress bars."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            print(self.format(record))
+
+
+def setup_logging(log_file: str | None = None, verbose: bool = False) -> None:
+    """Log progress to stderr, and to `log_file` when provided."""
+    handlers: list[logging.Handler] = [TqdmLoggingHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, mode="w", encoding="utf-8"))
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    for handler in handlers:
+        handler.setFormatter(formatter)
+    root = logging.getLogger()
+    root.handlers = handlers
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
+def fmt_duration(seconds: float) -> str:
+    """Render elapsed seconds as mm:ss or h:mm:ss."""
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def log_vram(stage: str = "") -> None:
+    """Log current/peak VRAM usage when running on CUDA."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 2**30
+        peak = torch.cuda.max_memory_allocated() / 2**30
+        suffix = f" [{stage}]" if stage else ""
+        log.info(f"VRAM{suffix}: allocated {allocated:.2f} GiB, peak {peak:.2f} GiB")
 
 
 def welford_gpu_batched_multilayer_float32(
@@ -45,7 +92,13 @@ def welford_gpu_batched_multilayer_float32(
     if is_vision_model and processor is not None:
         processor.tokenizer.padding_side = 'left'
 
-    for i in tqdm(range(0, len(formatted_prompts), batch_size), desc=desc):
+    num_batches = max(1, (len(formatted_prompts) + batch_size - 1) // batch_size)
+    log_interval = max(1, num_batches // 10)  # roughly 10 progress updates per pass
+    log.info(f"{desc}: {len(formatted_prompts)} prompts | batch size {batch_size} | {num_batches} batches")
+    pass_start = time.time()
+
+    for batch_num, i in enumerate(tqdm(range(0, len(formatted_prompts), batch_size), desc=desc), start=1):
+        batch_start = time.time()
         batch_prompts = formatted_prompts[i:i+batch_size]
 
         if is_vision_model and processor is not None:
@@ -127,6 +180,20 @@ def welford_gpu_batched_multilayer_float32(
         #del last_non_pad
         clear_device_cache()
 
+        batch_elapsed = time.time() - batch_start
+        elapsed = time.time() - pass_start
+        log.debug(f"{desc}: batch {batch_num}/{num_batches} took {batch_elapsed:.2f}s")
+        if batch_num % log_interval == 0 or batch_num == num_batches:
+            rate = batch_num / elapsed if elapsed > 0 else 0.0
+            eta = (num_batches - batch_num) / rate if rate > 0 else 0.0
+            log.info(
+                f"{desc}: {batch_num}/{num_batches} ({batch_num / num_batches:.0%}) | "
+                f"{batch_elapsed:.1f}s/batch | elapsed {fmt_duration(elapsed)} | ETA {fmt_duration(eta)}"
+            )
+            log_vram(desc)
+
+    log.info(f"{desc}: finished in {fmt_duration(time.time() - pass_start)}")
+
     # Move to CPU
     return_dict = {
         layer_idx: mean.to(device="cpu")
@@ -180,19 +247,24 @@ def compute_refusals(
         pos = 2
 
     focus_layers = range(num_layers) # sweep all layers
+    log.info(f"Measuring {num_layers} layers at token position {pos} (clip={clip}, projected={projected})")
 
+    phase_start = time.time()
     harmful_formatted = format_chats(tokenizer=tokenizer, prompt_list=harmful_list, processor=processor)
     harmful_means = welford_gpu_batched_multilayer_float32(
         harmful_formatted, "Generating harmful outputs", model, tokenizer,
         focus_layers, pos, inference_batch_size, clip, processor, is_vision_model
     )
+    log.info(f"Harmful pass finished in {fmt_duration(time.time() - phase_start)}")
     clear_device_cache()
     del harmful_formatted
+    phase_start = time.time()
     harmless_formatted = format_chats(tokenizer=tokenizer, prompt_list=harmless_list, processor=processor)
     harmless_means = welford_gpu_batched_multilayer_float32(
         harmless_formatted, "Generating harmless outputs", model, tokenizer, 
         focus_layers, pos, inference_batch_size, clip, processor, is_vision_model
     )
+    log.info(f"Harmless pass finished in {fmt_duration(time.time() - phase_start)}")
     del harmless_formatted
 
     results = {}
@@ -255,7 +327,7 @@ def clean_up() -> None:
     synchronize_device()
     clear_device_cache()
     gc.collect()  # Second pass for any refs broken by cache clear
-    print("Memory cleared successfully.")
+    log.info("Memory cleared successfully.")
 
 
 def debug_hook(name):
@@ -352,8 +424,28 @@ if __name__ == "__main__":
         default=False,
         help="Measure after second token instead of after first token",
     )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Also write progress logs to this file",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        default=False,
+        help="Log every batch instead of periodic progress updates",
+    )
 
     args = parser.parse_args()
+
+    setup_logging(args.log_file, args.verbose)
+    log.info("measure.py starting")
+    log.info(
+        f"model={args.model} | output={args.output} | quant={args.quant_measure or 'none'} | "
+        f"batch_size={args.batch_size} | clip={args.clip} | flash_attn={args.flash_attn} | "
+        f"projected={args.projected} | token2={args.token2} | deccp={args.deccp}"
+    )
 
     assert (
         isinstance(args.model, str)
@@ -366,13 +458,21 @@ if __name__ == "__main__":
 
     device = get_preferred_device()
     device_map = resolve_device_map()
+    log.info(
+        f"device={device} | device_map={device_map} | torch={torch.__version__} | "
+        f"cuda={torch.version.cuda or 'not available'}"
+    )
+    if device != "cuda":
+        log.warning("Running without CUDA — measurement will be very slow.")
 
     hf_token = get_hf_token()
+    log.info(f"HF token: {'found' if hf_token else 'not found (gated models may fail)'}")
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token  # also cover implicit Hub access
     model = args.model
     model_config = AutoConfig.from_pretrained(model, token=hf_token)
     model_type = getattr(model_config,"model_type")
+    log.info(f"Config loaded: model_type={model_type} | vision={hasattr(model_config, 'vision_config')}")
 
     # Get the precision/dtype from config, with proper fallback
     if hasattr(model_config, "torch_dtype") and model_config.torch_dtype is not None:
@@ -457,11 +557,20 @@ if __name__ == "__main__":
     else:
         harmless_list = load_data("./data/harmless.parquet")
 
+    log.info(f"Loaded {len(harmful_list)} harmful and {len(harmless_list)} harmless prompts")
+
     if args.deccp:
         deccp_list = load_dataset("augmxnt/deccp", split="censored", token=hf_token)
         harmful_list += deccp_list["text"]
+        log.info(f"Added {len(deccp_list)} deccp prompts -> {len(harmful_list)} harmful prompts")
 
     attn_impl = "flash_attention_2" if args.flash_attn and device == "cuda" else None
+
+    log.info(
+        f"Loading weights: dtype={precision} | quant={qbit or 'none'} | "
+        f"attn={attn_impl or 'default'} | device_map={device_map}"
+    )
+    load_start = time.time()
 
     if hasattr(model_config, "quantization_config"):
         model = AutoModelForCausalLM.from_pretrained(
@@ -484,6 +593,8 @@ if __name__ == "__main__":
             token=hf_token
         )
     model.requires_grad_(False)
+    log.info(f"Model loaded in {fmt_duration(time.time() - load_start)} | dtype={model.dtype}")
+    log_vram("after model load")
     if has_tied_weights(model_type):
         model.tie_weights()
 
@@ -518,10 +629,10 @@ if __name__ == "__main__":
                 token=hf_token,
             )
             tokenizer = processor.tokenizer
-            print("Loaded processor for vision model")
+            log.info("Loaded processor for vision model")
         except (IndexError, Exception) as e:
             # If processor loading fails, fall back to tokenizer only
-            print(f"Could not load processor ({e}), falling back to tokenizer only")
+            log.warning(f"Could not load processor ({e}), falling back to tokenizer only")
             has_vision = False
             tokenizer = AutoTokenizer.from_pretrained(
                 args.model,
@@ -538,8 +649,10 @@ if __name__ == "__main__":
             padding=True,
             token=hf_token,
         )
+        log.info("Loaded tokenizer")
 
-    print("Computing refusal information...")
+    log.info("Computing refusal information...")
+    measure_start = time.time()
     results = {}
     results = compute_refusals(
         model=model,
@@ -554,10 +667,15 @@ if __name__ == "__main__":
         token2=args.token2,
     )
 
-    print(f"Saving refusal information to {args.output}...")
+    log.info(f"Measurement finished in {fmt_duration(time.time() - measure_start)}")
+
+    log.info(f"Saving refusal information to {args.output}...")
     torch.save(results, args.output)
+    if os.path.exists(args.output):
+        log.info(f"Saved {os.path.getsize(args.output) / 2**20:.1f} MiB to {args.output}")
 
     # Release VRAM so next measurement can start immediately
-    print("Unloading model and clearing memory...")
+    log.info("Unloading model and clearing memory...")
     del model, tokenizer, processor, results
     clean_up()
+    log.info("Done.")

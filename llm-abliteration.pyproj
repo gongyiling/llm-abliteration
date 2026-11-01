@@ -13,7 +13,7 @@
     <RootNamespace>llm-abliteration</RootNamespace>
     <InterpreterId>MSBuild|env|$(MSBuildProjectFullPath)</InterpreterId>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
-    <CommandLineArguments>-m google/gemma-3-4b-it --deccp -o G:\llm-abliteration\data\gemma.ma --projected</CommandLineArguments>
+    <CommandLineArguments>-m google/gemma-3-4b-it --deccp -o G:\llm-abliteration\data\gemma.ma --projected -q 4bit</CommandLineArguments>
     <EnableNativeCodeDebugging>False</EnableNativeCodeDebugging>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
