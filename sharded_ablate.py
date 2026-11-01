@@ -13,6 +13,18 @@ from transformers.utils import cached_file
 from utils.device import clear_device_cache, get_preferred_device, synchronize_device
 
 
+def get_hf_token() -> str | None:
+    """Read HF token from env HF_TOKEN, else from local hf_token.txt (one line, not committed)."""
+    t = os.environ.get("HF_TOKEN")
+    if t:
+        return t
+    for fn in ("hf_token.txt", os.path.join(os.path.dirname(__file__), "hf_token.txt")):
+        if os.path.exists(fn):
+            with open(fn, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    return None
+
+
 def magnitude_sparsify(tensor: torch.Tensor, fraction: float) -> torch.Tensor:
     """Keep only the top fraction of values by magnitude, zero out the rest."""
     if fraction >= 1.0:
@@ -492,6 +504,7 @@ def ablate_by_layers_sharded(
     ensemble: bool,
     invert: bool,
     large_scale: float,
+    token: str | None = None,
 ) -> None:
     """
     Memory-efficient contrastive ablation for sharded models.
@@ -501,7 +514,7 @@ def ablate_by_layers_sharded(
 
     # Load config using transformers (handles both local and HF hub)
     print(f"Loading config for {model_name}...")
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, token=token)
 
     # Determine precision
     if hasattr(config, "torch_dtype"):
@@ -522,7 +535,7 @@ def ablate_by_layers_sharded(
     print(f"Model precision: {precision}")
 
     # Get the safetensors index file (handles cache)
-    index_path = cached_file(model_name, "model.safetensors.index.json")
+    index_path = cached_file(model_name, "model.safetensors.index.json", token=token)
     model_dir = Path(index_path).parent
 
     print(f"Model directory: {model_dir}")
@@ -712,7 +725,7 @@ def ablate_by_layers_sharded(
 
     for file in config_files:
         try:
-            src_path = cached_file(model_name, file)
+            src_path = cached_file(model_name, file, token=token)
             if src_path and os.path.exists(src_path):
                 shutil.copy(src_path, f"{output_path}/{file}")
         except Exception:
@@ -781,6 +794,11 @@ def main():
     ablations = ydata.get("ablate")
     large_scale = float(ydata.get("scale",1.0))
 
+    hf_token = get_hf_token()
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token  # also cover implicit Hub access
+    print(f"HF token: {'found' if hf_token else 'not found (gated models may fail)'}")
+
     print("=" * 60)
     print("SHARDED ABLATION CONFIGURATION")
     print("=" * 60)
@@ -832,6 +850,7 @@ def main():
         ensemble=args.layerensemble,
         invert=args.invert,
         large_scale=large_scale,
+        token=hf_token,
     )
 
     print("\n" + "=" * 60)

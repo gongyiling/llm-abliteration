@@ -1,128 +1,50 @@
+# Abliteration config for google/gemma-3-4b-it
+# The 4b model has 34 layers -> valid layer indices are 0..33 (the 12b example
+# goes up to 41 and must NOT be reused here).
+#
+#   layer       = destination layer; its self_attn.o_proj and mlp.down_proj are modified
+#   measurement = source layer whose refusal direction (refusenorm_<n>) is ablated out
+#   scale       = 1.0 -> full ablation, 0.0 -> no-op, <0 -> amplify
+#   sparsity    = keep only the top fraction of the direction by magnitude (0.0 = use it all)
+#
+# Source layers picked from `analyze.py data\gemma.ma`:
+#   layer 27: cos 0.9817, SNR 0.1934, purity 0.9805, quality 0.0035
+#   layer 31: cos 0.9723, SNR 0.2352, purity 0.9961, quality 0.0065
+
 model: google/gemma-3-4b-it
-measurements: data\gemma.ma
-output: outg3c4
+measurements: data/gemma.ma
+output: out_gemma3-4b-it
+scale: 1.0
+
 ablate:
-  - layer: 11
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 12
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 13
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 14
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 15
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 16
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 17
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 18
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 19
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 20
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 21
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 22
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 23
-    measurement: 23
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 24
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 25
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 26
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 27
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 28
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 29
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 30
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 31
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 32
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 33
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 34
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.00
-  - layer: 35
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.000
-  - layer: 36
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.000
-  - layer: 37
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.000
-  - layer: 38
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.000
-  - layer: 39
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.000
-  - layer: 40
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.000
-  - layer: 41
-    measurement: 29
-    scale: 1.0
-    sparsity: 0.000
+  # Layer 0 carries no signal in this measurement (cos = 1.0000, norm = 0),
+  # so ablation starts at layer 8.
+  # Early / middle layers: direction measured at layer 27
+  - {layer: 8,  measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 9,  measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 10, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 11, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 12, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 13, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 14, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 15, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 16, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 17, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 18, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 19, measurement: 27, scale: 1.0, sparsity: 0.0}
+  - {layer: 20, measurement: 27, scale: 1.0, sparsity: 0.0}
+
+  # Late layers: direction measured at layer 31 (highest purity)
+  - {layer: 21, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 22, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 23, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 24, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 25, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 26, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 27, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 28, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 29, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 30, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 31, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 32, measurement: 31, scale: 1.0, sparsity: 0.0}
+  - {layer: 33, measurement: 31, scale: 1.0, sparsity: 0.0}
