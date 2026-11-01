@@ -1,4 +1,5 @@
 import gc
+import os
 import torch
 from argparse import ArgumentParser
 from datasets import load_dataset
@@ -269,7 +270,16 @@ def debug_hook(name):
         print(f"Layer {name}: input_max={inp_max:.4f} | output_max={out_max:.4f}")
     return hook
 
-
+def get_hf_token():
+    """Read HF token from env HF_TOKEN, else from local hf_token.txt (one line, not committed)."""
+    t = os.environ.get("HF_TOKEN")
+    if t:
+        return t
+    for fn in ("hf_token.txt", os.path.join(os.path.dirname(__file__), "hf_token.txt")):
+        if os.path.exists(fn):
+            with open(fn, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    return None
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Measure models for analysis and abliteration")
@@ -357,8 +367,11 @@ if __name__ == "__main__":
     device = get_preferred_device()
     device_map = resolve_device_map()
 
+    hf_token = get_hf_token()
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token  # also cover implicit Hub access
     model = args.model
-    model_config = AutoConfig.from_pretrained(model)
+    model_config = AutoConfig.from_pretrained(model, token=hf_token)
     model_type = getattr(model_config,"model_type")
 
     # Get the precision/dtype from config, with proper fallback
@@ -445,7 +458,7 @@ if __name__ == "__main__":
         harmless_list = load_data("./data/harmless.parquet")
 
     if args.deccp:
-        deccp_list = load_dataset("augmxnt/deccp", split="censored")
+        deccp_list = load_dataset("augmxnt/deccp", split="censored", token=hf_token)
         harmful_list += deccp_list["text"]
 
     attn_impl = "flash_attention_2" if args.flash_attn and device == "cuda" else None
@@ -457,6 +470,7 @@ if __name__ == "__main__":
             dtype=precision,
             device_map=device_map,
             attn_implementation=attn_impl,
+            token=hf_token,
         )
     else:
         model = model_loader.from_pretrained(
@@ -467,6 +481,7 @@ if __name__ == "__main__":
             device_map=device_map,
             quantization_config=quant_config,
             attn_implementation=attn_impl,
+            token=hf_token
         )
     model.requires_grad_(False)
     if has_tied_weights(model_type):
@@ -500,6 +515,7 @@ if __name__ == "__main__":
                 args.model,
                 device_map=device_map,
                 padding=True,
+                token=hf_token,
             )
             tokenizer = processor.tokenizer
             print("Loaded processor for vision model")
@@ -512,6 +528,7 @@ if __name__ == "__main__":
 #                trust_remote_code=True,
                 device_map=device_map,
                 padding=True,
+                token=hf_token,
             )
     else:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -519,6 +536,7 @@ if __name__ == "__main__":
 #            trust_remote_code=True,
             device_map=device_map,
             padding=True,
+            token=hf_token,
         )
 
     print("Computing refusal information...")

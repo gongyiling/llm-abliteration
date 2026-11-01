@@ -123,6 +123,7 @@ celerybeat.pid
 
 # Environments
 .env
+hf_token.txt
 .venv
 env/
 venv/
