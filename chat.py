@@ -9,8 +9,12 @@ from transformers import (
     TextStreamer,
 )
 from argparse import ArgumentParser
+import os
+import time
 import torch
 from utils.device import get_preferred_device, resolve_device_map
+from utils.logging import fmt_duration, log, log_vram, setup_logging
+from utils.token import get_hf_token
 
 parser = ArgumentParser()
 parser.add_argument(
@@ -51,17 +55,40 @@ quant.add_argument(
 parser.add_argument(
     "--flash-attn", action="store_true", default=False, help="Use flash attention 2"
 )
+parser.add_argument(
+    "--log-file", type=str, default=None, help="Also write progress logs to this file"
+)
+parser.add_argument(
+    "--verbose", "-v", action="store_true", default=False, help="Enable debug-level logging"
+)
 args = parser.parse_args()
 
 
 if __name__ == "__main__":
+    setup_logging(args.log_file, args.verbose)
+    log.info("chat.py starting")
+
     device = get_preferred_device(args.device)
     device_map = resolve_device_map(args.device)
-    
+    log.info(
+        f"model={args.model} | device={device} | device_map={device_map} | "
+        f"max_new_tokens={args.max_new_tokens} | flash_attn={args.flash_attn}"
+    )
+
     torch.inference_mode()
     torch.set_grad_enabled(False)
 
-    model_config = AutoConfig.from_pretrained(args.model)
+    hf_token = get_hf_token()
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token  # also cover implicit Hub access
+    log.info(f"HF token: {'found' if hf_token else 'not found (gated models may fail)'}")
+
+    log.info(f"Loading config for {args.model}")
+    model_config = AutoConfig.from_pretrained(args.model, token=hf_token)
+    log.info(
+        f"Config loaded: model_type={getattr(model_config, 'model_type', 'unknown')} | "
+        f"vision={hasattr(model_config, 'vision_config')}"
+    )
 
     # Resolve precision with sensible defaults
     if args.precision == "auto":
@@ -99,9 +126,11 @@ if __name__ == "__main__":
             torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float32,
         )
 
+    log.info(f"Precision: {precision}")
+
     # Avoid fp16 instability on MPS unless user forced fp16 explicitly
     if device == "mps" and precision == torch.float16:
-        print("! Switching MPS to float32 for stability (fp16 can produce NaNs on MPS).")
+        log.warning("Switching MPS to float32 for stability (fp16 can produce NaNs on MPS).")
         precision = torch.float32
 
     # MPS cannot run bitsandbytes; keep old CUDA/CPU behavior untouched
@@ -109,7 +138,7 @@ if __name__ == "__main__":
         raise RuntimeError("BitsAndBytes quantization is not supported on MPS. Please disable --load-in-4bit/--load-in-8bit or use CUDA.")
 
     if args.load_in_4bit:
-        print("Loading in 4-bit...")
+        log.info("Loading in 4-bit...")
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=precision,
@@ -118,7 +147,7 @@ if __name__ == "__main__":
 #            llm_int8_skip_modules=None,
         )
     elif args.load_in_8bit:
-        print("Loading in 8-bit...")
+        log.info("Loading in 8-bit...")
         quant_config = BitsAndBytesConfig(
             load_in_8bit=True,
 #            llm_int8_enable_fp32_cpu_offload=True,
@@ -139,11 +168,13 @@ if __name__ == "__main__":
         model_loader = AutoModelForImageTextToText
 
     if hasattr(model_config, "quantization_config") and quant_config is not None:
-        print("Warning: model already has a quantization_config; --load-in-4bit/8bit flag may be ignored")
+        log.warning("Model already has a quantization_config; --load-in-4bit/8bit flag may be ignored")
 
-    print("precision",precision)
-    print("device map",device_map)
-    print("quant config",quant_config)
+    log.info(
+        f"Loading weights: quant={'4bit' if args.load_in_4bit else '8bit' if args.load_in_8bit else 'none'} | "
+        f"attn={attn_impl or 'default'}"
+    )
+    load_start = time.time()
     model = model_loader.from_pretrained(
         args.model,
         torch_dtype=precision,
@@ -151,7 +182,10 @@ if __name__ == "__main__":
         device_map=device_map,
         quantization_config=quant_config,
         attn_implementation=attn_impl,
+        token=hf_token,
     )
+    log.info(f"Model loaded in {fmt_duration(time.time() - load_start)} | dtype={model.dtype}")
+    log_vram("after model load")
 
     # Load processor for vision models, tokenizer for text-only models
     processor = None
@@ -161,18 +195,20 @@ if __name__ == "__main__":
                 args.model,
                 device_map=device_map,
                 padding=True,
+                token=hf_token,
             )
             tokenizer = processor.tokenizer
-            print("Loaded processor for vision model")
+            log.info("Loaded processor for vision model")
         except (IndexError, Exception) as e:
             # If processor loading fails, fall back to tokenizer
-            print(f"Could not load processor ({e}), falling back to tokenizer")
+            log.warning(f"Could not load processor ({e}), falling back to tokenizer")
             has_vision = False
             tokenizer = AutoTokenizer.from_pretrained(
                 args.model,
 #                trust_remote_code=True,
                 device_map=device_map,
                 padding=True,
+                token=hf_token,
             )
     else:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -180,7 +216,9 @@ if __name__ == "__main__":
 #            trust_remote_code=True,
             device_map=device_map,
             padding=True,
+            token=hf_token,
         )
+        log.info("Loaded tokenizer")
 
     # sampler settings can be placed here
     gen_config = GenerationConfig(
@@ -211,12 +249,24 @@ if __name__ == "__main__":
             return_dict=True,
         )
         input_ids = toks["input_ids"]
+        log.info(
+            f"Generating: {input_ids.shape[1]} prompt tokens | "
+            f"history {len(conversation)} messages | max_new_tokens={args.max_new_tokens}"
+        )
+        gen_start = time.time()
         with torch.inference_mode():
             gen = model.generate(
                 **{k: v.to(model.device) for k, v in toks.items()},
                 streamer=streamer,
                 generation_config=gen_config,
             )
+        new_tokens = gen.shape[1] - input_ids.shape[1]
+        gen_elapsed = time.time() - gen_start
+        speed = new_tokens / gen_elapsed if gen_elapsed > 0 else 0.0
+        log.info(
+            f"Generated {new_tokens} tokens in {gen_elapsed:.1f}s ({speed:.1f} tok/s)"
+        )
+        log_vram("after generation")
         decoded = tokenizer.decode(
             gen[0][input_ids.shape[1]:], skip_special_tokens=True
         )

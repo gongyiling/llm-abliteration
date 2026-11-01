@@ -163,3 +163,10 @@ cython_debug/
 #.idea/
 /.vs/llm-abliteration
 /.vs/llm-abliteration
+/out_gemma3-4b-it
+
+# GGUF export artifacts
+llama.cpp/
+*-gguf/
+*.gguf
+export_gguf.log
