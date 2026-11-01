@@ -1,5 +1,4 @@
 import gc
-import logging
 import os
 import time
 import torch
@@ -15,53 +14,10 @@ from transformers import BitsAndBytesConfig
 from transformers import PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerFast
 from utils.data import load_data
 from utils.models import has_tied_weights
+from utils.token import get_hf_token
+from utils.logging import fmt_duration, log, log_vram, setup_logging
 from utils.clip import magnitude_clip
 from utils.device import clear_device_cache, get_preferred_device, resolve_device_map, synchronize_device
-
-log = logging.getLogger("measure")
-
-
-class TqdmLoggingHandler(logging.Handler):
-    """Write log records through tqdm.write so they don't corrupt progress bars."""
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            tqdm.write(self.format(record))
-        except Exception:
-            print(self.format(record))
-
-
-def setup_logging(log_file: str | None = None, verbose: bool = False) -> None:
-    """Log progress to stderr, and to `log_file` when provided."""
-    handlers: list[logging.Handler] = [TqdmLoggingHandler()]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file, mode="w", encoding="utf-8"))
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    for handler in handlers:
-        handler.setFormatter(formatter)
-    root = logging.getLogger()
-    root.handlers = handlers
-    root.setLevel(logging.DEBUG if verbose else logging.INFO)
-
-
-def fmt_duration(seconds: float) -> str:
-    """Render elapsed seconds as mm:ss or h:mm:ss."""
-    total = max(0, int(seconds))
-    hours, rem = divmod(total, 3600)
-    minutes, secs = divmod(rem, 60)
-    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
-
-
-def log_vram(stage: str = "") -> None:
-    """Log current/peak VRAM usage when running on CUDA."""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 2**30
-        peak = torch.cuda.max_memory_allocated() / 2**30
-        suffix = f" [{stage}]" if stage else ""
-        log.info(f"VRAM{suffix}: allocated {allocated:.2f} GiB, peak {peak:.2f} GiB")
 
 
 def welford_gpu_batched_multilayer_float32(
@@ -341,17 +297,6 @@ def debug_hook(name):
         out_max = t.abs().max().item() if not torch.isnan(t).any() else float('nan')
         print(f"Layer {name}: input_max={inp_max:.4f} | output_max={out_max:.4f}")
     return hook
-
-def get_hf_token():
-    """Read HF token from env HF_TOKEN, else from local hf_token.txt (one line, not committed)."""
-    t = os.environ.get("HF_TOKEN")
-    if t:
-        return t
-    for fn in ("hf_token.txt", os.path.join(os.path.dirname(__file__), "hf_token.txt")):
-        if os.path.exists(fn):
-            with open(fn, "r", encoding="utf-8") as f:
-                return f.read().strip()
-    return None
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Measure models for analysis and abliteration")

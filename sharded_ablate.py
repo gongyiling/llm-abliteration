@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import shutil
+import time
 import torch
 import yaml
 from pathlib import Path
@@ -11,18 +12,8 @@ from tqdm import tqdm
 from transformers import AutoConfig
 from transformers.utils import cached_file
 from utils.device import clear_device_cache, get_preferred_device, synchronize_device
-
-
-def get_hf_token() -> str | None:
-    """Read HF token from env HF_TOKEN, else from local hf_token.txt (one line, not committed)."""
-    t = os.environ.get("HF_TOKEN")
-    if t:
-        return t
-    for fn in ("hf_token.txt", os.path.join(os.path.dirname(__file__), "hf_token.txt")):
-        if os.path.exists(fn):
-            with open(fn, "r", encoding="utf-8") as f:
-                return f.read().strip()
-    return None
+from utils.logging import fmt_duration, log, log_vram, setup_logging
+from utils.token import get_hf_token
 
 
 def magnitude_sparsify(tensor: torch.Tensor, fraction: float) -> torch.Tensor:
@@ -532,13 +523,13 @@ def ablate_by_layers_sharded(
         }
         precision = precision_map.get(precision, torch.float32)
 
-    print(f"Model precision: {precision}")
+    log.info(f"Model precision: {precision}")
 
     # Get the safetensors index file (handles cache)
     index_path = cached_file(model_name, "model.safetensors.index.json", token=token)
     model_dir = Path(index_path).parent
 
-    print(f"Model directory: {model_dir}")
+    log.info(f"Model directory: {model_dir}")
 
     with open(index_path) as f:
         index = json.load(f)
@@ -603,29 +594,45 @@ def ablate_by_layers_sharded(
                 shard_modifications[shard_file] = []
             shard_modifications[shard_file].append((key, layer, measurement, scale, sparsity))
 
-    print(f"\nWill modify {len(shard_modifications)} shards out of {len(set(weight_map.values()))} total")
+    total_tensors = sum(len(v) for v in shard_modifications.values())
+    log.info(
+        f"Will modify {len(shard_modifications)} shards out of {len(set(weight_map.values()))} total "
+        f"({total_tensors} tensors)"
+    )
 
     os.makedirs(output_path, exist_ok=True)
 
     # Process each shard
     all_shards = sorted(set(weight_map.values()))
+    total_shards = len(all_shards)
+    run_start = time.time()
 
-    for shard_file in tqdm(all_shards, desc="Processing shards"):
+    for shard_idx, shard_file in enumerate(tqdm(all_shards, desc="Processing shards"), start=1):
         shard_path = model_dir / shard_file
+        shard_start = time.time()
 
         if shard_file in shard_modifications:
-            print(f"\nLoading and modifying {shard_file}...")
+            log.info(
+                f"[{shard_idx}/{total_shards}] Loading and modifying {shard_file} "
+                f"({len(shard_modifications[shard_file])} tensors)"
+            )
 
             # Load the entire shard
             state_dict = load_file(str(shard_path))
 
             # Apply all modifications for this shard
-            for key, layer, measurement, scale, sparsity in shard_modifications[shard_file]:
+            for tensor_idx, (key, layer, measurement, scale, sparsity) in enumerate(
+                shard_modifications[shard_file], start=1
+            ):
                 if key in state_dict:
                     if "experts" in key:
-                        print(f"  Modifying Expert in Layer {layer}: {key}")
+                        log.debug(f"Modifying Expert in Layer {layer}: {key}")
                     else:
-                        print(f"  Modifying Layer {layer}: {key}")
+                        log.debug(f"Modifying Layer {layer}: {key}")
+                    if tensor_idx % 10 == 0:
+                        log.info(
+                            f"  {shard_file}: {tensor_idx}/{len(shard_modifications[shard_file])} tensors done"
+                        )
 
                     refusal_dir = measures[f'refusenorm_{measurement}'].double()
                     #harmful_dir = measures[f'harmful_{layer}'].double()
@@ -696,7 +703,7 @@ def ablate_by_layers_sharded(
                     gc.collect()
 
             # Save modified shard
-            print(f"  Saving {shard_file}...")
+            log.info(f"[{shard_idx}/{total_shards}] Saving {shard_file}...")
             save_file(state_dict, f"{output_path}/{shard_file}")
 
             # Clean up
@@ -704,12 +711,23 @@ def ablate_by_layers_sharded(
             gc.collect()
             clear_device_cache()
 
+            elapsed = time.time() - run_start
+            rate = shard_idx / elapsed if elapsed > 0 else 0.0
+            eta = (total_shards - shard_idx) / rate if rate > 0 else 0.0
+            log.info(
+                f"[{shard_idx}/{total_shards}] {shard_file} done in "
+                f"{fmt_duration(time.time() - shard_start)} | elapsed {fmt_duration(elapsed)} | "
+                f"ETA {fmt_duration(eta)}"
+            )
+            log_vram("shard done")
+
         else:
             # Just copy unmodified shards (no need to load)
             shutil.copy(str(shard_path), f"{output_path}/{shard_file}")
+            log.info(f"[{shard_idx}/{total_shards}] Copied {shard_file} (no changes)")
 
     # Copy the index file
-    print("\nCopying configuration files...")
+    log.info("Copying configuration files...")
     shutil.copy(str(index_path), f"{output_path}/model.safetensors.index.json")
 
     # Copy all config files that exist
@@ -732,7 +750,7 @@ def ablate_by_layers_sharded(
             # File doesn't exist, skip it
             pass
 
-    print(f"\nModified model saved to {output_path}")
+    log.info(f"Modified model saved to {output_path} in {fmt_duration(time.time() - run_start)}")
 
 
 def main():
@@ -781,8 +799,23 @@ def main():
         default=False,
         help='Compute intervention as directional mean from 3 layers centered on intended measurement layer',
     )
+    parser.add_argument(
+        '--log-file',
+        type=str,
+        default=None,
+        help='Also write progress logs to this file',
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action="store_true",
+        default=False,
+        help='Log every modified tensor instead of periodic progress updates',
+    )
 
     args = parser.parse_args()
+
+    setup_logging(args.log_file, args.verbose)
+    log.info("sharded_ablate.py starting")
 
     # Load YAML configuration
     with open(args.file_path, 'r') as file:
@@ -799,25 +832,25 @@ def main():
         os.environ["HF_TOKEN"] = hf_token  # also cover implicit Hub access
     print(f"HF token: {'found' if hf_token else 'not found (gated models may fail)'}")
 
-    print("=" * 60)
-    print("SHARDED ABLATION CONFIGURATION")
-    print("=" * 60)
-    print(f"Model: {model_name}")
-    print(f"Measurements: {measurement_file}")
-    print(f"Output directory: {output_dir}")
-    print(f"Number of ablations: {len(ablations)}")
-    print(f"Householder ablation: {args.householder}")
-    print(f"Directional ablation: {args.directional}")
-    print(f"Norm preservation: {args.normpreserve}")
-    print(f"Projected: {args.projected}")
-    print(f"Layer ensemble: {args.layerensemble}")
-    print(f"Invert ablation to induction: {args.invert}")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("SHARDED ABLATION CONFIGURATION")
+    log.info("=" * 60)
+    log.info(f"Model: {model_name}")
+    log.info(f"Measurements: {measurement_file}")
+    log.info(f"Output directory: {output_dir}")
+    log.info(f"Number of ablations: {len(ablations)}")
+    log.info(f"Householder ablation: {args.householder}")
+    log.info(f"Directional ablation: {args.directional}")
+    log.info(f"Norm preservation: {args.normpreserve}")
+    log.info(f"Projected: {args.projected}")
+    log.info(f"Layer ensemble: {args.layerensemble}")
+    log.info(f"Invert ablation to induction: {args.invert}")
+    log.info("=" * 60)
 
     # Load measurements
-    print(f"\nLoading measurements from {measurement_file}...")
+    log.info(f"Loading measurements from {measurement_file}...")
     measures = torch.load(measurement_file)
-    print(f"Loaded {len(measures)} measurements")
+    log.info(f"Loaded {len(measures)} entries covering {measures['layers']} layers")
 
     # Parse ablation orders, with defaults
     orders = [
@@ -830,14 +863,17 @@ def main():
         for item in ablations
     ]
 
-    print("\nAblation orders:")
+    log.info(
+        f"Ablation orders: {len(orders)} destination layers "
+        f"({min(o[0] for o in orders)}-{max(o[0] for o in orders)})"
+    )
     for layer, measurement, scale, sparsity in orders:
-        print(f"  Layer {layer}: measurement={measurement}, scale={scale}, sparsity={sparsity}")
+        log.debug(f"  Layer {layer}: measurement={measurement}, scale={scale}, sparsity={sparsity}")
 
     # Perform sharded ablation
-    print("\n" + "=" * 60)
-    print("STARTING ABLATION")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("STARTING ABLATION")
+    log.info("=" * 60)
     ablate_by_layers_sharded(
         model_name=model_name,
         measures=measures,
@@ -853,9 +889,9 @@ def main():
         token=hf_token,
     )
 
-    print("\n" + "=" * 60)
-    print("ABLATION COMPLETE")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("ABLATION COMPLETE")
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":
